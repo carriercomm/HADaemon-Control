@@ -5,8 +5,10 @@ use strict;
 use warnings;
 
 use POSIX ();
+use Time::HiRes;
 use Cwd qw(abs_path);
 use File::Path qw(make_path);
+use File::Basename qw(dirname);
 use Scalar::Util qw(weaken);
 use IPC::ConcurrencyLimit::WithStandby;
 
@@ -14,9 +16,9 @@ our $VERSION = '0.5';
 
 # Accessor building
 my @accessors = qw(
-    pid_dir quiet color_map name kill_timeout program program_args
-    stdout_file stderr_file umask directory ipc_cl_options
-    main_stop_file standby_stop_file uid gid log_file process_name_change
+    pid_dir quiet color_map name stop_file_kill_timeout signal_kill_timeout kill_timeout
+    stop_signals program program_args stdout_file stderr_file umask directory ipc_cl_options
+    main_stop_file standby_stop_file uid gid log_file process_name_change close_fds_on_start
     path init_config init_code lsb_start lsb_stop lsb_sdesc lsb_desc
 );
 
@@ -73,6 +75,9 @@ sub run_command {
 
     defined($self->kill_timeout)
         or $self->kill_timeout(1);
+
+    defined($self->close_fds_on_start)
+        or $self->close_fds_on_start(1);
 
     $self->standby_stop_file
         or $self->standby_stop_file($self->pid_dir . '/standby-stop-file');
@@ -134,7 +139,6 @@ sub run_command {
 sub do_start {
     my ($self) = @_;
     $self->info('do_start()');
-    $self->_precreate_directories();
 
     my $expected_main = $self->_expected_main_processes();
     my $expected_standby = $self->_expected_standby_processes();
@@ -146,6 +150,7 @@ sub do_start {
         return 0;
     }
 
+    $self->_precreate_directories();
     $self->_unlink_file($self->standby_stop_file);
 
     if ($self->_fork_mains() && $self->_fork_standbys()) {
@@ -164,7 +169,6 @@ sub do_start {
 sub do_stop {
     my ($self) = @_;
     $self->info('do_stop()');
-    $self->_precreate_directories();
 
     if (!$self->_main_running() && !$self->_standby_running()) {
         $self->pretty_print('stopping main + standby processes', 'Not Running', 'red');
@@ -172,12 +176,19 @@ sub do_stop {
         return 0;
     }
 
+    $self->_precreate_directories();
     $self->_write_file($self->standby_stop_file);
     $self->_wait_standbys_to_complete();
 
-    foreach my $type ($self->_expected_main_processes()) {
-        my $pid = $self->_pid_of_process_type($type);
-        if ($pid && $self->_kill_pid($pid)) {
+    my %mains = map {
+        $_ => $self->_pid_of_process_type($_)
+    } $self->_expected_main_processes();
+
+    my %running_pids = $self->_kill_pids(values %mains);
+
+    foreach my $type (%mains) {
+        my $pid = $mains{$type};
+        if ($pid && !exists $running_pids{$pid}) {
             $self->_unlink_file($self->_build_pid_file($type));
         }
     }
@@ -196,7 +207,6 @@ sub do_stop {
 sub do_restart {
     my ($self) = @_;
     $self->info('do_restart()');
-    $self->_precreate_directories();
 
     # shortcut
     if (!$self->_main_running() && !$self->_standby_running()) {
@@ -209,7 +219,9 @@ sub do_restart {
     }
 
     # stoping standby
+    $self->_precreate_directories();
     $self->_write_file($self->standby_stop_file);
+
     if (not $self->_wait_standbys_to_complete()) {
         $self->pretty_print('stopping standby processes', 'Failed', 'red');
         $self->warn("all standby processes should be stopped at this moment. Can't move forward");
@@ -231,14 +243,24 @@ sub do_restart {
 
     $self->pretty_print('starting standby processes', 'OK');
 
-    # killing mains, stanbys should be promoted instantly
-    foreach my $type ($self->_expected_main_processes()) {
+    my %mains = map {
+        my $type = $_;
         my $pid = $self->_pid_of_process_type($type)
           or $self->trace("Main process $type is not running"),
             next;
 
-        $self->_kill_pid($pid)
-            or $self->pretty_print($type, 'Failed to restart', 'red');
+        $type => $pid;
+    } $self->_expected_main_processes();
+
+    # killing mains, stanbys should be promoted instantly
+    my %running_pids = $self->_kill_pids(values %mains);
+
+    foreach my $type (%mains) {
+        my $pid = $mains{$type};
+        if ($pid && exists $running_pids{$pid}) {
+            # failed to restart process
+            $self->pretty_print($type, 'Failed to restart', 'red');
+        }
     }
 
     # starting mains
@@ -284,12 +306,13 @@ sub do_status {
 sub do_fork {
     my ($self) = @_;
     $self->info('do_fork()');
-    $self->_precreate_directories();
 
     return 1 if $self->_check_stop_file();
 
+    $self->_precreate_directories();
     $self->_fork_mains();
     $self->_fork_standbys();
+
     return 0;
 }
 
@@ -338,9 +361,10 @@ sub _fork_mains {
         my $to_start = $expected_main - $self->_main_running();
         $self->_fork() foreach (1 .. $to_start);
 
-        for (1 .. $self->_standby_timeout) {
+        my $end = Time::HiRes::time + $self->_standby_timeout;
+        while (Time::HiRes::time < $end) {
             return 1 if $self->_main_running() == $expected_main;
-            sleep(1);
+            Time::HiRes::sleep(0.1);
         }
     }
 
@@ -355,9 +379,10 @@ sub _fork_standbys {
         my $to_start = $expected_standby - $self->_standby_running();
         $self->_fork() foreach (1 .. $to_start);
 
-        for (1 .. $self->_standby_timeout) {
+        my $end = Time::HiRes::time + $self->_standby_timeout;
+        while (Time::HiRes::time < $end) {
             return 1 if $self->_standby_running() == $expected_standby;
-            sleep(1);
+            Time::HiRes::sleep(0.1);
         }
     }
 
@@ -396,45 +421,75 @@ sub _pid_of_process_type {
     return $pid && $self->_pid_running($pid) ? $pid : undef;
 }
 
-sub _kill_pid {
-    my ($self, $pid) = @_;
-    $self->trace("_kill_pid(): $pid");
+sub _kill_pids {
+    my ($self, @p) = @_;
+    $self->trace("_kill_pids(): @p");
 
+    my %pids = map {
+        my $pid_and_maybe_cmd = $_;
+        if ($ENV{HADC_TRACE} && open(my $fh, '<', "/proc/$_/cmdline")) {
+            my $cmd = <$fh>;
+            close $fh;
+            $pid_and_maybe_cmd .= " ($cmd)" if $cmd;
+        }
+
+        $_ => $pid_and_maybe_cmd
+    } grep { $_ } @p;
+
+    # first create all stopfiles if necessary
     if ($self->main_stop_file) {
-        # main_stop_file is defined, try to touch it
-        my $stop_file_name = $self->_build_main_stop_file($pid);
-        $self->_write_file($stop_file_name);
-
-        for (1 .. $self->kill_timeout) {
-            if (not $self->_pid_running($pid)) {
-                $self->trace("Successfully killed $pid via stop file");
-                $self->_unlink_file($stop_file_name);
-                return 1;
-            }
-
-            sleep 1;
+        foreach my $pid (keys %pids) {
+            $self->_write_file($self->_build_main_stop_file($pid));
         }
 
-        $self->info("Failed to kill process $pid via stop file");
-        $self->_unlink_file($stop_file_name);
-    }
+        my $stop_file_timeout = $self->stop_file_kill_timeout // $self->kill_timeout;
+        my $end = Time::HiRes::time + $stop_file_timeout;
 
-    foreach my $signal (qw(TERM TERM INT KILL)) {
-        $self->trace("Sending $signal signal to pid $pid...");
-        $self->_kill_or_die($signal, $pid);
+        while (%pids && Time::HiRes::time < $end) {
+            foreach my $pid (keys %pids) {
+                if (not $self->_pid_running($pid)) {
+                    $self->trace("Successfully killed $pids{$pid} via stop file");
+                    $self->_unlink_file($self->_build_main_stop_file($pid));
+                    delete $pids{$pid}
+                }
 
-        for (1 .. $self->kill_timeout) {
-            if (not $self->_pid_running($pid)) {
-                $self->trace("Successfully killed $pid");
-                return 1;
+                Time::HiRes::sleep(0.1);
             }
+        }
 
-            sleep 1;
+        foreach my $pid (keys %pids) {
+            $self->info("Failed to kill process $pids{$pid} via stop file");
+            $self->_unlink_file($self->_build_main_stop_file($pid));
         }
     }
 
-    $self->trace("Failed to kill $pid");
-    return 0;
+    my @stop_signals = @{ $self->stop_signals // [qw(TERM TERM INT KILL)] };
+    my $signal_timeout = $self->signal_kill_timeout // $self->kill_timeout;
+
+    foreach my $signal (@stop_signals) {
+        foreach my $pid (keys %pids) {
+            $self->trace("Sending $signal signal to pid $pids{$pid}...");
+            $self->_kill_or_die($signal, $pid);
+        }
+
+        my $end = Time::HiRes::time + $signal_timeout;
+        while (%pids && Time::HiRes::time < $end) {
+            foreach my $pid (keys %pids) {
+                if (not $self->_pid_running($pid)) {
+                    $self->trace("Successfully killed $pids{$pid}");
+                    delete $pids{$pid}
+                }
+
+                Time::HiRes::sleep(0.1);
+            }
+        }
+    }
+
+    foreach my $pid (keys %pids) {
+        $self->trace("Failed to kill $pids{$pid}");
+    }
+
+    return %pids;
 }
 
 sub _kill_or_die {
@@ -454,9 +509,10 @@ sub _wait_standbys_to_complete {
     my ($self) = @_;
     $self->trace('_wait_all_standbys_to_complete()');
 
-    for (1 .. $self->_standby_timeout) {
+    my $end = Time::HiRes::time + $self->_standby_timeout;
+    while (Time::HiRes::time < $end) {
         return 1 if $self->_standby_running() == 0;
-        sleep(1);
+        Time::HiRes::sleep(0.1);
     }
 
     return 0;
@@ -478,11 +534,13 @@ sub _fork {
         $pid2 and $self->trace("forked $pid2");
 
         if ($pid2 == 0) { # Our double fork.
-            # close all file handlers but logging one
-            my $log_fd = fileno($self->{log_fh});
-            my $max_fd = POSIX::sysconf( &POSIX::_SC_OPEN_MAX );
-            $max_fd = 64 if !defined $max_fd or $max_fd < 0;
-            $log_fd != $_ and POSIX::close($_) foreach (3 .. $max_fd);
+            if ($self->close_fds_on_start) {
+                # close all file handlers but logging one
+                my $log_fd = fileno($self->{log_fh});
+                my $max_fd = POSIX::sysconf( &POSIX::_SC_OPEN_MAX );
+                $max_fd = 64 if !defined $max_fd or $max_fd < 0;
+                $log_fd != $_ and POSIX::close($_) foreach (3 .. $max_fd);
+            }
 
             # reopening STDIN, STDOUT, STDERR and redirect them to log_file
             # I need to redirect them because otherwise standbys will keep
@@ -599,6 +657,8 @@ sub _acquire_lock_and_launch_program {
     }
 
     $self->info("acquired main lock id: " . $ipc->lock_id());
+
+    $self->{ipc_cl_lock_id} = $ipc->lock_id;
     
     # now pid file should be 'main-$id'
     $pid_file = $self->_build_pid_file("main-$id");
@@ -700,7 +760,15 @@ sub _create_dir {
     if (-d $dir) {
         $self->trace("Dir exists ($dir) - no need to create");
     } else {
-        make_path($dir, { uid => $self->uid, group => $self->gid, mode => 0755, error => \my $errors });
+        my $make_path_args = { mode => 0755, error => \my $errors };
+        if ($self->uid) {
+            $make_path_args->{user} = $self->uid;
+        }
+        if ($self->gid) {
+            $make_path_args->{group} = $self->gid;
+        }
+
+        make_path($dir, $make_path_args);
         @$errors and $self->die("failed make_path: " . join(' ', map { keys $_, values $_ } @$errors));
         $self->trace("Created dir ($dir)");
     }
@@ -711,6 +779,13 @@ sub _precreate_directories {
     $self->_create_dir($self->pid_dir);
     $self->_create_dir($self->{ipc_cl_options}->{path});
     $self->_create_dir($self->{ipc_cl_options}->{standby_path});
+
+    if ($self->{main_stop_file}) {
+        $self->_create_dir(dirname($self->{main_stop_file}));
+    }
+    if ($self->{standby_stop_file}) {
+        $self->_create_dir(dirname($self->{standby_stop_file}));
+    }
 }
 
 sub _check_stop_file {
@@ -794,9 +869,9 @@ sub pretty_print {
     $process_type =~ s/-/ #/;
 
     if ($ENV{HADC_NO_COLORS}) {
-        printf("%s: %-40s %40s\n", $self->name, $process_type, "[$message]");
+        printf("%-40s: %-40s %40s\n", $self->name, $process_type, "[$message]");
     } else {
-        printf("%s: %-40s %40s\n", $self->name, $process_type, "\033[$code" ."m[$message]\033[0m");
+        printf("%-40s: %-40s %40s\n", $self->name, $process_type, "\033[$code" ."m[$message]\033[0m");
     }
 }
 
@@ -812,7 +887,9 @@ sub _log {
     }
 
     if ($self->{log_fh} && defined fileno($self->{log_fh})) {
-        my $date = POSIX::strftime("%Y-%m-%d %H:%M:%S", localtime(time()));
+        my $now = Time::HiRes::time();
+        my ($sec, $ms) = split(/[.]/, $now);
+        my $date = POSIX::strftime("%Y-%m-%d %H:%M:%S", localtime($now)) . sprintf('.%05d', $ms // 0);
         printf { $self->{log_fh} } "[%s][%d][%s] %s\n", $date, $$, $level, $message;
         $self->{log_fh}->flush();
     }
@@ -830,7 +907,8 @@ sub _all_actions {
 }
 
 sub _standby_timeout {
-    return int(shift->{ipc_cl_options}->{interval} // 0) + 3;
+    my $timeout = int(shift->{ipc_cl_options}->{interval} // 0) * 3;
+    return $timeout < 1 ? 1 : $timeout;
 }
 
 sub info { $_[0]->_log('INFO', $_[1]); }
@@ -1016,7 +1094,7 @@ By default HADaemon::Control sets following settings:
 =head2 main_stop_file
 
 This option provides an alternative way of stopping main processes apart of sending a signal (ex. TERM). If specified,
-HADaemon::Control touch this file and wait L<kill_timeout> seconds hoping that main processes will respect the file
+HADaemon::Control touch this file and wait L<stop_file_kill_timeout> or L<kill_timeout> seconds hoping that main processes will respect the file
 and exit. If not, normal termination loop is entered (i.e. sending sequence of signals TERM TERM INT KILL).
 The filename can include %p which is replaced by PID of a process. Default value is undef.
 
@@ -1025,6 +1103,10 @@ The filename can include %p which is replaced by PID of a process. Default value
 The path to stop file for standby process. See C<do_start>, C<do_stop>, C<do_restart> for details. By default is set to:
 
     $daemon->standby_stop_file($daemon->pid_dir . '/standby-stop-file');
+
+=head2 stop_signals
+
+An array ref of signals that should be tried (in order) when stopping the daemon. Default signals are C<TERM>, C<TERM>, C<INT> and C<KILL> (yes, C<TERM> is tried twice).
 
 =head2 log_file
 
@@ -1125,11 +1207,31 @@ If provided stderr of main process will be redirected to the given file.
 
 =head2 kill_timeout
 
-This provides an amount of time in seconds between kill signals being
-sent to the daemon. This value should be increased if your daemon has
+This provides an amount of time in seconds between trying different means
+of terminating the daemon. This value should be increased if your daemon has
 a longer shutdown period. By default 1 second is used.
 
     $daemon->kill_timeout( 7 );
+
+This value is used both for stop files and signals.
+
+=head2 stop_file_kill_timeout
+
+This is a more specific variant of L<kill_timeout>. It provides the amount of seconds
+we allow the daemon to terminate itself once a stop file has been created.
+
+If provided, this value has priority over L<kill_timeout>.
+
+    $daemon->stop_file_kill_timeout( 42 );
+
+=head2 signal_kill_timeout
+
+This is a more specific variant of L<kill_timeout>. It provides the amount of seconds
+between firing different signals to terminate the daemon.
+
+If provided, this value has priority over L<kill_timeout>.
+
+    $daemon->signal_kill_timeout( 42 );
 
 =head2 quiet
 
@@ -1137,6 +1239,24 @@ If this boolean flag is set to a true value all output from the init script
 (NOT your daemon) to STDOUT will be suppressed.
 
     $daemon->quiet( 1 );
+
+=head2 close_fds_on_start
+
+By default HADC closes all file descriptors apart of STDIN, STDOUT, STDERR
+and lock fd (see HADC_lock_fd) when it starts main process.
+This is done to make sure that main and standby processes are really
+independent of each other.
+
+If this behaivor is not desirable, one can set close_fds_on_start to 0.
+But it should be understood that if parent process open any file descriptor
+(i.e. establish any connection, open file, create pipe, etc) those FDs will
+be available in *both* main and standby processes. Such case can be dangerous. Consider this:
+- parent processes (i.e. processes which run HADC) connect to DB
+- HADC starts main processes which uses that DB connection
+- HADC starts standby process
+- after a while main processes crashes and leave connectiong to DB in unpredicted state
+- standby processes promotes to main one and try to use *same* connection to DB.
+  Since connection is in unpredicted state, it failes to use connection and crashes too.
 
 =head1 INIT FILE CONSTRUCTOR OPTIONS
 
@@ -1319,9 +1439,31 @@ red and green. If C<HADC_NO_COLORS> environment variable is set no colors are us
 
     $daemon->pretty_print( "My Status", "red" );
 
+=head1 KNOWN ISSUES
+
+HADaemon::Control uses C<flock> based locks. This type of locks have property of getting
+inherited accross C<fork> system call. This behavior is not desirable and actually
+destructible for HADaemon::Control. Once the locked is inherited, two processes
+(parent and child) will own the same lock. Only releasing the lock from both processes
+allows another one to acuire the lock. To prevent such behivour HADaemon::Control exposes
+lock's file descriptor via HADC_lock_fd environment variable.
+
+If an application forks, a child process should close lock's file descriptor right after
+exiting from C<fork> syscal. One of the possible ways is to run:
+
+    $ENV{HADC_lock_fd} and POSIX::close($ENV{HADC_lock_fd});
+
+Another source of troubles could be the fact that HADC closes all file descriptors apart
+of STDIN, STDOUT, STDERR and lock fd upon starting main processes (tunable via C<close_fds_on_start>).
+This's done for a reason. See C<close_fds_on_start> for details.
+
 =head1 AUTHOR
 
 Ivan Kruglov, C<ivan.kruglov@yahoo.com>
+
+=head1 CONTRIBUTORS
+
+Alexey Surikov C<alexey.surikov@booking.com>
 
 =head1 ACKNOWLEDGMENT
 
